@@ -6,6 +6,7 @@ import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 from loguru import logger
+from easydict import EasyDict as edict
 
 class Pose:
     """
@@ -234,6 +235,18 @@ def create_frustum(K: np.ndarray, w2c: np.ndarray, ret_ray: bool = False):
     else:
         return frustum
 
+def show_pcd(visualizer, pcd_filename=None, name='pcd'):
+    pcd = o3d.io.read_point_cloud(pcd_filename)
+    pcd_material = o3d.visualization.rendering.MaterialRecord()# 怎么都是0啊！怪不得显示不出来
+    pcd_material.shader = "defaultLit"
+    pcd_material.base_roughness = 0.15
+    pcd_material.base_reflectance = 0.72
+    pcd_material.point_size = 5
+    color=[1, 0, 0]
+    color = np.array(color).reshape(1, 3)
+    color = np.repeat(color, np.asarray(pcd.points).shape[0], 0)
+    pcd.colors = o3d.utility.Vector3dVector(color)
+    visualizer.add_geometry(name, pcd, pcd_material)
 
 def show_mesh(visualizer, mesh=None, verts: np.ndarray=None, faces:np.ndarray=None, name="mesh"):
     """show mesh if given, else contruct mesh from verts and faces. present with lightning
@@ -315,3 +328,135 @@ def load_colmap_pose(project_path: str):
     pose = [i[1][1] for i in res]  # from colmap
     pose = torch.tensor(np.stack(pose))
     return pose
+
+def procrustes_analysis(X0,X1): # [N,3]                                  # 对齐操作
+    # translation
+    t0 = X0.mean(dim=0,keepdim=True)
+    t1 = X1.mean(dim=0,keepdim=True)
+    X0c = X0-t0
+    X1c = X1-t1
+    # scale
+    s0 = (X0c**2).sum(dim=-1).mean().sqrt()
+    s1 = (X1c**2).sum(dim=-1).mean().sqrt()
+    X0cs = X0c/s0
+    X1cs = X1c/s1
+    # rotation (use double for SVD, float loses precision)
+    U,S,V = (X0cs.t()@X1cs).double().svd(some=True)
+    R = (U@V.t()).float()
+    print(R)
+    print(R.det())
+    if R.det()<0: R[0] *= -1 # R[1] should multiply -1 # TODO: 这里检查一下！！！！
+    print(R)
+    print(R.det())
+    # align X1 to X0: X1to0 = (X1-t1)/s1@R.t()*s0+t0
+    sim3 = edict(t0=t0[0],t1=t1[0],s0=s0,s1=s1,R=R)
+    return sim3
+
+def to_hom(X: torch.Tensor):
+    # get homogeneous coordinates of the input
+    X_hom = torch.cat([X,torch.ones_like(X[...,:1])],dim=-1)
+    return X_hom
+
+def cam2world(X: torch.Tensor, pose: torch.Tensor):
+    X_hom = to_hom(X)
+    pose_inv = Pose().invert(pose)
+    return X_hom@pose_inv.transpose(-1,-2)
+
+def prealign_cameras(pose: torch.Tensor, pose_GT: torch.Tensor):
+    # compute 3D similarity transform via Procrustes analysis
+    center = torch.zeros(1, 1, 3, device=pose.device)
+    center_pred = cam2world(center, pose)[:, 0]  # [N,3]
+    center_GT = cam2world(center, pose_GT)[:, 0]  # [N,3]
+    try:
+        sim3 = procrustes_analysis(
+            center_GT, center_pred
+        )  # 求解一个放射变换，将求解得到的pose与pose_gt进行对齐
+    except:
+        print("warning: SVD did not converge...")
+        sim3 = edict(t0=0, t1=0, s0=1, s1=1, R=torch.eye(3, device=pose.device))
+    # align the camera poses
+    center_aligned = (center_pred - sim3.t1) / sim3.s1 @ sim3.R.t() * sim3.s0 + sim3.t0
+    print("sim3: {}".format(sim3))
+    R_aligned = pose[..., :3] @ sim3.R.t()
+    t_aligned = (-R_aligned @ center_aligned[..., None])[..., 0]
+    pose_aligned = pose_util(R=R_aligned, t=t_aligned)
+    return pose_aligned, sim3
+
+def rotation_distance(R1, R2, eps=1e-7):
+    # http://www.boris-belousov.net/2016/12/01/quat-dist/
+    R_diff = R1@R2.transpose(-2,-1)
+    trace = R_diff[...,0,0]+R_diff[...,1,1]+R_diff[...,2,2]
+    angle = ((trace-1)/2).clamp(-1+eps,1-eps).acos_() # numerical stability near -1/+1
+    return angle
+
+
+def evaluate_camera_alignment(pose_aligned, pose_GT):
+    """
+    Inputs:
+        pose_aligned:   (N, 3, 4) c2w
+        pose_GT:        (N, 3, 4) c2w
+    Outputs:
+        R_error:        np.array
+        t_error:        np.array
+        t_scale_error:  np.array
+        ATE_error:      np.array
+    """
+    R_aligned, t_aligned = pose_aligned.split([3, 1], dim=-1)  # torch.Size([49, 3, 3])
+    R_GT, t_GT = pose_GT.split([3, 1], dim=-1)  # t_GT: torch.Size([49, 3, 1])
+
+    R_error = rotation_distance(R_aligned, R_GT)
+    R_error = np.rad2deg(R_error.mean().cpu())
+
+    t_error = (t_aligned - t_GT)[..., 0].norm(
+        dim=-1
+    )  # t_error ([49]) 每一项存放的是每一个点的位姿偏移量
+    t_error = t_error.mean().cpu().numpy()
+
+    ATE_error = (
+        torch.sqrt(((t_aligned - t_GT)[..., 0] ** 2).sum(dim=-1).mean()).cpu().numpy()
+    )
+
+    avg_scale = (
+        ((torch.norm(t_aligned[..., 0], dim=-1) + torch.norm(t_GT[..., 0], dim=-1)) / 2)
+        .mean()
+        .cpu()
+        .numpy()
+    )
+
+    error = edict(R=R_error, t=t_error, t_scale=t_error / avg_scale, ATE=ATE_error)
+    return error
+
+def eval_poses(poses_all, poses_gt_all, mode="normal"):
+    """
+    Inputs:
+        poses_all:      w2c, numpy | torch
+        poses_gt_all:   w2c, numpy | torch
+        mode:           'normal': return None
+                        'ret_align': return aligned pose
+    """
+    if isinstance(poses_all, np.ndarray):
+        poses_all = torch.tensor(poses_all)
+    if isinstance(poses_gt_all, np.ndarray):
+        poses_gt_all = torch.tensor(poses_gt_all)
+        
+    if poses_all.shape[0] > 2:
+        pose_aligned, sim3 = prealign_cameras(poses_all.float(), poses_gt_all)
+        error = evaluate_camera_alignment(
+            pose_util.invert(
+                pose_aligned
+            ),  # convert w2c to c2w, c2w is suitable for compute loss
+            pose_util.invert(poses_gt_all),
+        )
+        logger.info("rotation error: {}".format(error.R))
+        logger.info("translation error: {}".format(error.t))
+        # logger.info("translation/scale error: {}".format(error.t_scale))
+        logger.info("ATE error: {}".format(error.ATE))
+    else:
+        logger.error("input poses has only {} images".format(poses_all.shape[0]))
+
+    if mode == "ret_align":
+        return pose_aligned
+    elif mode == 'ret_sim3':
+        return pose_aligned, sim3
+    else:
+        return error
